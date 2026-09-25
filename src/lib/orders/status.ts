@@ -1,0 +1,37 @@
+/**
+ * Internal status values stay in English and match the existing Supabase
+ * `order_status` enum (unchanged, per approved Phase 4/5 design). Thai
+ * labels are display-only, used in LINE replies and the dashboard.
+ */
+export type OrderStatus = "pending" | "making" | "done" | "cancelled";
+
+export const STATUS_LABELS_TH: Record<OrderStatus, string> = {
+  pending: "สั่งซื้อ",
+  making: "รับออเดอร์",
+  done: "ชำระเงินแล้ว",
+  cancelled: "ยกเลิก",
+};
+
+/**
+ * LINE status command codes (!#<order-number> <code>) map 1:1 to the
+ * fixed four statuses. Code 1 is reachable for completeness/lookup context
+ * even though new orders already start at "pending".
+ */
+export const STATUS_CODE_MAP: Record<"1" | "2" | "3" | "4", OrderStatus> = {
+  "1": "pending",
+  "2": "making",
+  "3": "done",
+  "4": "cancelled",
+};
+
+export function isValidStatusCode(code: string): code is "1" | "2" | "3" | "4" {
+  return code === "1" || code === "2" || code === "3" || code === "4";
+}
+
+export function statusFromCode(code: string): OrderStatus | null {
+  return isValidStatusCode(code) ? STATUS_CODE_MAP[code] : null;
+}
+
+export function thaiLabelFor(status: OrderStatus): string {
+  return STATUS_LABELS_TH[status];
+}

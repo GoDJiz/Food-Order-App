@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-pastel-purple: #c9a8e0;
+  --color-pastel-pink: #f4c9dc;
+  --color-bg: #faf7fb;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: #333333;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
