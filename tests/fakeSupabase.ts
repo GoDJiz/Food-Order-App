@@ -11,6 +11,7 @@ export class FakeSupabase {
     orders: [],
     line_events: [],
     order_number_counters: [],
+    pending_product_confirmations: [],
   };
 
   from(table: string) {
@@ -37,7 +38,7 @@ class FakeQueryBuilder {
   private filters: Array<(row: Row) => boolean> = [];
   private insertRows: Row[] | null = null;
   private updateValues: Row | null = null;
-  private mode: "select" | "insert" | "update" = "select";
+  private mode: "select" | "insert" | "update" | "delete" = "select";
   private countMode = false;
 
   constructor(private db: FakeSupabase, private table: string) {}
@@ -61,6 +62,16 @@ class FakeQueryBuilder {
 
   in(col: string, vals: any[]) {
     this.filters.push((row) => vals.includes(row[col]));
+    return this;
+  }
+
+  is(col: string, val: null) {
+    this.filters.push((row) => (row[col] ?? null) === val);
+    return this;
+  }
+
+  delete() {
+    this.mode = "delete";
     return this;
   }
 
@@ -96,6 +107,11 @@ class FakeQueryBuilder {
     if (this.mode === "update" && this.updateValues) {
       const rows = this.matching();
       rows.forEach((row) => Object.assign(row, this.updateValues));
+      return { data: rows[0] ?? null, error: null };
+    }
+    if (this.mode === "delete") {
+      const rows = this.matching();
+      this.db.tables[this.table] = this.db.tables[this.table].filter((row) => !rows.includes(row));
       return { data: rows[0] ?? null, error: null };
     }
     const rows = this.matching();
@@ -143,6 +159,12 @@ class FakeQueryBuilder {
     }
     if (this.countMode) {
       resolve({ data: null, error: null, count: this.matching().length });
+      return;
+    }
+    if (this.mode === "delete") {
+      const rows = this.matching();
+      this.db.tables[this.table] = this.db.tables[this.table].filter((row) => !rows.includes(row));
+      resolve({ data: null, error: null });
       return;
     }
     resolve({ data: this.matching(), error: null });

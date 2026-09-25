@@ -1,9 +1,18 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { replyToLine } from "@/lib/line/replyMessage";
 import { parseOrderMessage } from "@/lib/line/parseOrderMessage";
+import { parseConfirmationCommand, parsePriceArgument } from "@/lib/line/parseConfirmationCommand";
 import { matchProduct } from "@/lib/orders/matchProduct";
 import { extractCustomer } from "@/lib/orders/extractCustomer";
-import { listProducts } from "@/lib/products/products";
+import { searchSimilarProducts } from "@/lib/orders/similarProducts";
+import {
+  getActivePendingConfirmation,
+  createPendingConfirmation,
+  consumePendingConfirmation,
+  type PendingConfirmationRecord,
+} from "@/lib/orders/pendingConfirmation";
+import { listProducts, createProduct } from "@/lib/products/products";
+import type { ProductRecord } from "@/lib/orders/getActiveProductByName";
 import { getOrderByNumber } from "@/lib/orders/getOrderByNumber";
 import { updateOrderStatus } from "@/lib/orders/updateOrderStatus";
 import { createOrder } from "@/lib/orders/createOrder";
@@ -19,13 +28,19 @@ import {
   buildAmbiguousQuantityReply,
   buildInvalidQuantityReply,
   buildDailySummaryReply,
+  buildSimilarProductSingleReply,
+  buildSimilarProductMultipleReply,
+  buildNoSimilarProductReply,
+  buildNoPendingConfirmationReply,
+  buildInvalidSelectionReply,
+  buildInvalidPriceReply,
 } from "@/lib/line/buildReplyText";
 
 export interface LineEvent {
   type: string;
   webhookEventId: string;
   replyToken?: string;
-  source?: { groupId?: string; type?: string };
+  source?: { groupId?: string; userId?: string; type?: string };
   message?: { type: string; text?: string };
 }
 
@@ -66,17 +81,43 @@ export async function handleEvent(
   }
 
   const text = event.message.text ?? "";
+  const groupId = event.source?.groupId ?? "";
+  const userId = event.source?.userId ?? null;
+
+  if (!event.replyToken) {
+    return { replied: false }; // nothing we can reply to
+  }
+
+  // Pending-confirmation replies (ใช่ / เลือก N / สร้าง <price>) are checked
+  // BEFORE the existing "!"-prefixed command parsing. They intentionally
+  // don't use "!" (see parseConfirmationCommand.ts), which is safe because
+  // they only ever do anything when an active pending confirmation already
+  // exists for this (group, user) scope -- otherwise they fall straight
+  // through to today's unchanged "not_a_command" handling below.
+  const confirmationCommand = parseConfirmationCommand(text);
+  if (confirmationCommand) {
+    const replyText = await handlePendingConfirmationReply(
+      supabase,
+      groupId,
+      userId,
+      confirmationCommand
+    );
+    if (replyText !== null) {
+      await replyToLine(event.replyToken, replyText, channelAccessToken);
+      return { replied: true, replyText };
+    }
+    // No pending confirmation existed and the text also isn't a valid
+    // order/status/summary command -- fall through exactly as an ordinary
+    // unrecognized message would (no reply), since e.g. a bare "ใช่" said
+    // casually in chat with nothing pending should stay silent.
+  }
+
   const command = parseOrderMessage(text);
 
   if (command.kind === "not_a_command") {
     return { replied: false }; // ordinary group chat message, not addressed to the bot
   }
 
-  if (!event.replyToken) {
-    return { replied: false }; // nothing we can reply to
-  }
-
-  const groupId = event.source?.groupId ?? null;
   let replyText: string;
 
   switch (command.kind) {
@@ -87,10 +128,56 @@ export async function handleEvent(
 
       if (!match.matched) {
         if (match.reason === "ambiguous") {
+          // Existing Damerau-Levenshtein <= 1 ambiguity -- unchanged.
           replyText = buildAmbiguousProductReply(match.candidates);
+          break;
+        }
+
+        // Existing exact + distance<=1 passes found nothing. Only now does
+        // the NEW similarity tier run, per the approved matching order.
+        const attemptedName = command.tokens.slice(0, command.qtyIndex).join(" ");
+        // The entire pre-quantity span is the attempted product text here
+        // (nothing matched at any prefix length), so it is excluded in
+        // full -- passing qtyIndex (not 0) as the "consumed" count.
+        const customerForPending = extractCustomer(command.tokens, command.qtyIndex, command.qtyIndex, "");
+        const similar = searchSimilarProducts(attemptedName, activeProducts);
+
+        if (similar.kind === "none") {
+          await createPendingConfirmation(supabase, {
+            groupId,
+            userId,
+            mode: "create",
+            rawQuery: attemptedName,
+            candidates: [],
+            quantity: command.quantity,
+            customerName: customerForPending,
+          });
+          replyText = buildNoSimilarProductReply(attemptedName);
+        } else if (similar.kind === "single") {
+          await createPendingConfirmation(supabase, {
+            groupId,
+            userId,
+            mode: "confirm",
+            rawQuery: attemptedName,
+            candidates: [{ id: similar.product.id, name: similar.product.name }],
+            quantity: command.quantity,
+            customerName: customerForPending,
+          });
+          replyText = buildSimilarProductSingleReply(attemptedName, similar.product.name);
         } else {
-          const attemptedName = command.tokens.slice(0, command.qtyIndex).join(" ");
-          replyText = buildProductNotFoundReply(attemptedName);
+          await createPendingConfirmation(supabase, {
+            groupId,
+            userId,
+            mode: "select",
+            rawQuery: attemptedName,
+            candidates: similar.candidates.map((p) => ({ id: p.id, name: p.name })),
+            quantity: command.quantity,
+            customerName: customerForPending,
+          });
+          replyText = buildSimilarProductMultipleReply(
+            attemptedName,
+            similar.candidates.map((p) => p.name)
+          );
         }
         break;
       }
@@ -107,7 +194,7 @@ export async function handleEvent(
         product: match.product,
         quantity: command.quantity,
         customer,
-        lineGroupId: groupId,
+        lineGroupId: groupId || null,
       });
       replyText = buildOrderSummaryReply(order, match.product.unit);
       break;
@@ -165,4 +252,105 @@ export async function handleEvent(
 
   await replyToLine(event.replyToken, replyText, channelAccessToken);
   return { replied: true, replyText };
+}
+
+/**
+ * Resolves a ใช่ / เลือก N / สร้าง <price> reply against the active pending
+ * confirmation for this (group, user) scope, if any. Returns the reply
+ * text to send, or null if there was nothing pending AND the raw text
+ * doesn't otherwise look like a confirmation attempt worth responding to
+ * (so the caller can silently fall through, matching how every other
+ * unaddressed message in this system is handled).
+ */
+async function handlePendingConfirmationReply(
+  supabase: SupabaseClient,
+  groupId: string,
+  userId: string | null,
+  command: NonNullable<ReturnType<typeof parseConfirmationCommand>>
+): Promise<string | null> {
+  const pending = await getActivePendingConfirmation(supabase, groupId, userId);
+
+  if (!pending) {
+    // Distinguishing "expired" from "never existed" is intentionally not
+    // done here -- both cases get the same reply, per the approved design.
+    return buildNoPendingConfirmationReply();
+  }
+
+  switch (command.kind) {
+    case "confirm_yes": {
+      if (pending.mode !== "confirm" || pending.candidates.length !== 1) {
+        return buildNoPendingConfirmationReply();
+      }
+      return resolveWithExistingProduct(supabase, pending, pending.candidates[0].id);
+    }
+
+    case "confirm_select": {
+      if (pending.mode !== "select") {
+        return buildNoPendingConfirmationReply();
+      }
+      const chosen = pending.candidates[command.index - 1];
+      if (!chosen) {
+        // Invalid selection -- pending state is left intact so the user
+        // can retry with a valid number within the expiry window.
+        return buildInvalidSelectionReply(pending.candidates.length);
+      }
+      return resolveWithExistingProduct(supabase, pending, chosen.id);
+    }
+
+    case "confirm_create": {
+      if (pending.mode !== "create") {
+        return buildNoPendingConfirmationReply();
+      }
+      const price = parsePriceArgument(command.rawPrice);
+      if (price === null) {
+        // Invalid price -- pending state is left intact, same reasoning
+        // as an invalid selection above.
+        return buildInvalidPriceReply();
+      }
+      const product = await createProduct(supabase, {
+        name: pending.raw_query,
+        unit: "",
+        selling_price: price,
+        cost_price: 0,
+        active: true,
+      });
+      await consumePendingConfirmation(supabase, pending.id);
+      const order = await createOrder(supabase, {
+        product,
+        quantity: pending.quantity,
+        customer: pending.customer_name,
+        lineGroupId: groupId || null,
+      });
+      return buildOrderSummaryReply(order, product.unit);
+    }
+
+    default:
+      return buildNoPendingConfirmationReply();
+  }
+}
+
+async function resolveWithExistingProduct(
+  supabase: SupabaseClient,
+  pending: PendingConfirmationRecord,
+  productId: string
+): Promise<string> {
+  const products = await listProducts(supabase);
+  const product = products.find((p: ProductRecord) => p.id === productId);
+
+  await consumePendingConfirmation(supabase, pending.id);
+
+  if (!product) {
+    // The product was deactivated/removed in the window between the
+    // proposal and the confirmation -- treat it the same as "not found"
+    // rather than creating an order against a product that's gone.
+    return buildProductNotFoundReply(pending.raw_query);
+  }
+
+  const order = await createOrder(supabase, {
+    product,
+    quantity: pending.quantity,
+    customer: pending.customer_name,
+    lineGroupId: pending.line_group_id || null,
+  });
+  return buildOrderSummaryReply(order, product.unit);
 }

@@ -583,3 +583,453 @@ test("end-to-end: attached digit+unit resolves like the whitespace-separated cas
   assert.equal(db.tables.orders[0].quantity, 12);
   assert.equal(db.tables.orders[0].customer_name, "พี่ไก่"); // unit stripped, not left in customer
 });
+
+// --- Similar-product-before-create flow (new feature) ---
+
+test("similar product: single match -> confirmation prompt, no order/product created yet", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-sim-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 0, "no order should exist yet");
+  assert.match(result.replyText!, /พบสินค้าที่ใกล้เคียง: ข้าวเหนียวขาว\+หมูทอด/);
+  assert.match(result.replyText!, /พิมพ์ "ใช่"/);
+  assert.equal(db.tables.pending_product_confirmations.length, 1);
+  assert.equal(db.tables.pending_product_confirmations[0].mode, "confirm");
+});
+
+test("similar product: multiple matches -> numbered selection prompt", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  seedProduct(db, { id: "p2", name: "เหนียวขาวหมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-sim-2",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 0);
+  assert.match(result.replyText!, /1\. ข้าวเหนียวขาว\+หมูทอด/);
+  assert.match(result.replyText!, /2\. เหนียวขาวหมูทอด/);
+  assert.equal(db.tables.pending_product_confirmations[0].mode, "select");
+});
+
+test("no similar product -> create-product prompt", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม" }); // unrelated product
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-sim-3",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.match(result.replyText!, /ไม่พบสินค้าที่ใกล้เคียง/);
+  assert.match(result.replyText!, /ต้องการสร้างสินค้าใหม่หรือไม่/);
+  assert.equal(db.tables.pending_product_confirmations[0].mode, "create");
+});
+
+test("ใช่ consumes the pending state and completes the original order", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด", selling_price: 30, cost_price: 15 });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-yes-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-yes-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "ใช่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.pending_product_confirmations.length, 0, "pending state must be consumed");
+  assert.equal(db.tables.orders.length, 1);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "ข้าวเหนียวขาว+หมูทอด");
+  assert.equal(db.tables.orders[0].quantity, 1);
+  assert.equal(db.tables.orders[0].customer_name, "ก๊อต");
+  assert.equal(db.tables.orders[0].selling_price_snapshot, 30);
+  assert.match(result.replyText!, /สินค้า ข้าวเหนียวขาว\+หมูทอด/);
+});
+
+test("เลือก N consumes the pending state and completes the order with the chosen product", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  seedProduct(db, { id: "p2", name: "เหนียวขาวหมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-sel-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-sel-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "เลือก 2" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.pending_product_confirmations.length, 0);
+  assert.equal(db.tables.orders.length, 1);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "เหนียวขาวหมูทอด");
+});
+
+test("สร้าง 50 creates the product and continues the original order automatically", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-create-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-create-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "สร้าง 50" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.pending_product_confirmations.length, 0);
+  assert.equal(db.tables.products.length, 2, "new product should be created");
+  const newProduct = db.tables.products.find((p: any) => p.name === "ข้าวเหนียวขาว+หมูทอด+แหนม");
+  assert.ok(newProduct);
+  assert.equal(newProduct!.selling_price, 50);
+  assert.equal(db.tables.orders.length, 1);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "ข้าวเหนียวขาว+หมูทอด+แหนม");
+  assert.equal(db.tables.orders[0].customer_name, "ก๊อต");
+  assert.match(result.replyText!, /สินค้า ข้าวเหนียวขาว\+หมูทอด\+แหนม/);
+});
+
+test("สร้าง 50 without any pending state does not create anything", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db);
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-stray-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "สร้าง 50" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.products.length, 1, "no product should be created");
+  assert.equal(db.tables.orders.length, 0);
+  assert.match(result.replyText!, /ไม่มีคำสั่งที่รอดำเนินการ/);
+});
+
+test("expired pending state: ใช่ after 5 minutes reports nothing pending and creates nothing", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-exp-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  // Simulate expiry by manually pushing expires_at into the past.
+  db.tables.pending_product_confirmations[0].expires_at = new Date(Date.now() - 1000).toISOString();
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-exp-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "ใช่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 0);
+  assert.match(result.replyText!, /ไม่มีคำสั่งที่รอดำเนินการ/);
+});
+
+test("two users in the same LINE group cannot resolve each other's pending requests", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  // User A triggers a pending confirmation.
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-cross-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-A", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  // User B (different person, same group) tries to confirm it.
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-cross-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-B", type: "group" },
+      message: { type: "text", text: "ใช่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 0, "user B must not be able to resolve user A's pending request");
+  assert.match(result.replyText!, /ไม่มีคำสั่งที่รอดำเนินการ/);
+  assert.equal(db.tables.pending_product_confirmations.length, 1, "user A's pending request is untouched");
+});
+
+test("missing userId fallback: two senders with no userId in the same group share group-level scope", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-nouid-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", type: "group" }, // no userId provided by LINE
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-nouid-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", type: "group" }, // also no userId
+      message: { type: "text", text: "ใช่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 1, "group-level fallback scope should resolve successfully");
+  assert.match(result.replyText!, /สินค้า ข้าวเหนียวขาว\+หมูทอด/);
+});
+
+test("invalid selection (เลือก 3 with only 2 candidates) does not create an order", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ข้าวเหนียวขาว+หมูทอด" });
+  seedProduct(db, { id: "p2", name: "เหนียวขาวหมูทอด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-badsel-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-badsel-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "เลือก 3" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 0);
+  assert.match(result.replyText!, /กรุณาเลือกหมายเลข 1-2/);
+  assert.equal(db.tables.pending_product_confirmations.length, 1, "pending state stays intact for a retry");
+});
+
+test("invalid price (สร้าง abc / สร้าง -50 / สร้าง 0) does not create a product", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-badprice-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!ข้าวเหนียวขาว+หมูทอด+แหนม 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const abc = await handleEvent(
+    { type: "message", webhookEventId: "evt-badprice-2", replyToken: "r2", source: { groupId: "group-1", userId: "user-1", type: "group" }, message: { type: "text", text: "สร้าง abc" } } as any,
+    db as any,
+    "fake-token"
+  );
+  const negative = await handleEvent(
+    { type: "message", webhookEventId: "evt-badprice-3", replyToken: "r3", source: { groupId: "group-1", userId: "user-1", type: "group" }, message: { type: "text", text: "สร้าง -50" } } as any,
+    db as any,
+    "fake-token"
+  );
+  const zero = await handleEvent(
+    { type: "message", webhookEventId: "evt-badprice-4", replyToken: "r4", source: { groupId: "group-1", userId: "user-1", type: "group" }, message: { type: "text", text: "สร้าง 0" } } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.products.length, 1, "no product should be created from any invalid price");
+  assert.equal(db.tables.orders.length, 0);
+  assert.match(abc.replyText!, /ราคาไม่ถูกต้อง/);
+  assert.match(negative.replyText!, /ราคาไม่ถูกต้อง/);
+  assert.match(zero.replyText!, /ราคาไม่ถูกต้อง/);
+  assert.equal(db.tables.pending_product_confirmations.length, 1, "pending state stays intact for a retry");
+});
+
+test("existing Damerau-Levenshtein <= 1 ambiguous-product behavior is unaffected by the new similarity tier", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "ABC" });
+  seedProduct(db, { id: "p2", name: "ABD" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-existing-ambig",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!AB 1 customer" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 0);
+  assert.match(result.replyText!, /พบสินค้าที่เป็นไปได้หลายรายการ/);
+  assert.equal(db.tables.pending_product_confirmations.length, 0, "the OLD ambiguous-fuzzy path must not touch pending state at all");
+});

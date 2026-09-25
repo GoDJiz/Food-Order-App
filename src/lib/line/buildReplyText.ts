@@ -56,6 +56,54 @@ export function buildInvalidQuantityReply(reason: "zero_or_negative" | "decimal"
   return "❗ จำนวนไม่ถูกต้อง กรุณาระบุจำนวนที่มากกว่า 0";
 }
 
+/** Exactly one similar existing product found — requires explicit "ใช่". */
+export function buildSimilarProductSingleReply(rawQuery: string, candidateName: string): string {
+  return (
+    `❗ ไม่พบสินค้าตรงชื่อ "${rawQuery}"\n` +
+    `พบสินค้าที่ใกล้เคียง: ${candidateName}\n` +
+    `ใช่สินค้านี้หรือไม่?\n` +
+    `พิมพ์ "ใช่" เพื่อยืนยัน`
+  );
+}
+
+/** Multiple plausible similar products found — requires "เลือก N". */
+export function buildSimilarProductMultipleReply(rawQuery: string, candidateNames: string[]): string {
+  const list = candidateNames.map((name, i) => `${i + 1}. ${name}`).join("\n");
+  return (
+    `❗ ไม่พบสินค้าตรงชื่อ "${rawQuery}"\n` +
+    `พบสินค้าที่ใกล้เคียง:\n${list}\n` +
+    `กรุณาเลือกสินค้า\n` +
+    `เช่น\n` +
+    `เลือก 1`
+  );
+}
+
+/** No similar product at all — offers to create a new one via "สร้าง <price>". */
+export function buildNoSimilarProductReply(rawQuery: string): string {
+  return (
+    `❗ ไม่พบสินค้าที่ใกล้เคียง\n` +
+    `สินค้า: ${rawQuery}\n` +
+    `ต้องการสร้างสินค้าใหม่หรือไม่?\n` +
+    `กรุณาระบุราคาขาย เช่น\n` +
+    `สร้าง 50`
+  );
+}
+
+/** No active pending confirmation for ใช่ / เลือก N / สร้าง <price> — includes an already-expired one. */
+export function buildNoPendingConfirmationReply(): string {
+  return "ไม่มีคำสั่งที่รอดำเนินการ";
+}
+
+/** เลือก N where N is out of range for the candidates that were actually offered. */
+export function buildInvalidSelectionReply(candidateCount: number): string {
+  return `❗ กรุณาเลือกหมายเลข 1-${candidateCount}`;
+}
+
+/** สร้าง <price> where the price is missing, non-numeric, zero, or negative. */
+export function buildInvalidPriceReply(): string {
+  return "❗ ราคาไม่ถูกต้อง กรุณาระบุราคาที่มากกว่า 0 เช่น สร้าง 50";
+}
+
 export interface DailySummaryLine {
   productName: string;
   quantity: number;
