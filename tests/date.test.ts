@@ -5,6 +5,8 @@ import {
   businessDateToOrderPrefix,
   formatOrderNumber,
   isValidOrderNumberFormat,
+  looksLikeOrderNumber,
+  normalizeOrderNumber,
 } from "@/lib/date";
 
 test("formats business date as YYYY-MM-DD in Asia/Bangkok", () => {
@@ -32,7 +34,19 @@ test("formats a full order number", () => {
 test("validates order number format", () => {
   assert.equal(isValidOrderNumberFormat("#260916-0001"), true);
   assert.equal(isValidOrderNumberFormat("#26091-0001"), false);
-  assert.equal(isValidOrderNumberFormat("260916-0001"), false);
+  assert.equal(isValidOrderNumberFormat("260916-0001"), false); // canonical form always requires "#"
   assert.equal(isValidOrderNumberFormat("#260916-001"), false);
   assert.equal(isValidOrderNumberFormat("#abcdef-0001"), false);
+});
+
+test("looksLikeOrderNumber accepts both with and without a leading #", () => {
+  assert.equal(looksLikeOrderNumber("#260916-0001"), true);
+  assert.equal(looksLikeOrderNumber("260916-0001"), true);
+  assert.equal(looksLikeOrderNumber("26091-0001"), false);
+  assert.equal(looksLikeOrderNumber("##260916-0001"), false);
+});
+
+test("normalizeOrderNumber adds # only when missing", () => {
+  assert.equal(normalizeOrderNumber("260916-0001"), "#260916-0001");
+  assert.equal(normalizeOrderNumber("#260916-0001"), "#260916-0001");
 });

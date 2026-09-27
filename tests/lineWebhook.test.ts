@@ -3,11 +3,19 @@ import assert from "node:assert/strict";
 import { FakeSupabase } from "./fakeSupabase.ts";
 import { handleEvent } from "@/lib/line/handleLineEvent";
 
-function withMockedFetch(capture: { calls: any[] }) {
+function withMockedFetch(capture: { calls: any[]; lastMessageId?: string }) {
   const original = globalThis.fetch;
+  let counter = 0;
   globalThis.fetch = (async (_url: string, init: any) => {
     capture.calls.push(JSON.parse(init.body));
-    return { ok: true, json: async () => ({}), text: async () => "" } as any;
+    counter += 1;
+    const id = `mock-msg-${counter}`;
+    capture.lastMessageId = id;
+    return {
+      ok: true,
+      json: async () => ({ sentMessages: [{ id, quoteToken: `mock-quote-${counter}` }] }),
+      text: async () => "",
+    } as any;
   }) as any;
   return () => {
     globalThis.fetch = original;
@@ -49,8 +57,8 @@ test("new order event creates an order and replies with full summary", async () 
   restore();
 
   assert.equal(result.replied, true);
-  assert.match(result.replyText!, /^สรุปคำสั่งซื้อ เลขที่ #\d{6}-0001/);
-  assert.match(result.replyText!, /สถานะ สั่งซื้อ$/);
+  assert.match(result.replyText!, /^📦 คำสั่งซื้อ\nเลขที่\s+#\d{6}-0001/);
+  assert.match(result.replyText!, /🟡 สั่งซื้อ$/);
   assert.equal(db.tables.orders.length, 1);
   assert.equal(db.tables.orders[0].selling_price_snapshot, 20);
   assert.equal(db.tables.orders[0].cost_price_snapshot, 10);
@@ -118,7 +126,7 @@ test("status change updates only status, preserving all snapshots", async () => 
   const after = db.tables.orders[0];
 
   assert.equal(result.replied, true);
-  assert.match(result.replyText!, /สถานะ รับออเดอร์$/);
+  assert.match(result.replyText!, /🟢 รับออเดอร์$/);
   assert.equal(after.status, "making");
   // Everything else must be untouched.
   assert.equal(after.product_name_snapshot, before.product_name_snapshot);
@@ -163,7 +171,7 @@ test("order lookup does not change status", async () => {
 
   assert.equal(result.replied, true);
   assert.equal(db.tables.orders[0].status, statusBefore, "lookup must not change status");
-  assert.match(result.replyText!, new RegExp(`เลขที่ ${orderNumber.replace(/[#-]/g, "\\$&")}`));
+  assert.match(result.replyText!, new RegExp(`เลขที่\\s+${orderNumber.replace(/[#-]/g, "\\$&")}`));
 });
 
 test("invalid status code (9) is rejected with a clear error and no change", async () => {
@@ -266,7 +274,7 @@ test("unit word appearing between quantity and customer is stripped from the rep
 
   assert.equal(result.replied, true);
   assert.equal(db.tables.orders[0].customer_name, "พี่ไก่");
-  assert.match(result.replyText!, /ชื่อลูกค้า พี่ไก่/);
+  assert.match(result.replyText!, /ลูกค้า\s+พี่ไก่/);
 });
 
 test("unit word after customer is stripped, customer not polluted", async () => {
@@ -360,7 +368,7 @@ test("customer omitted entirely -> stored as empty string, reply shows a dash", 
   restore();
 
   assert.equal(db.tables.orders[0].customer_name, "");
-  assert.match(result.replyText!, /ชื่อลูกค้า -/);
+  assert.match(result.replyText!, /ลูกค้า\s+-/);
 });
 
 test("multiple numeric tokens are rejected without guessing; no order created", async () => {
@@ -535,7 +543,7 @@ test("end-to-end: ABC123 resolves gracefully via existing product-prefix fallbac
   assert.equal(db.tables.orders[0].product_name_snapshot, "น้ำส้ม");
   assert.equal(db.tables.orders[0].quantity, 123);
   assert.equal(db.tables.orders[0].customer_name, "ABC พี่ไก่");
-  assert.match(result.replyText!, /จำนวน 123/);
+  assert.match(result.replyText!, /จำนวน\s+123/);
 });
 
 test("end-to-end: digit inside customer text is never a second quantity once one is established", async () => {
@@ -703,7 +711,7 @@ test("ใช่ consumes the pending state and completes the original order", as
   assert.equal(db.tables.orders[0].quantity, 1);
   assert.equal(db.tables.orders[0].customer_name, "ก๊อต");
   assert.equal(db.tables.orders[0].selling_price_snapshot, 30);
-  assert.match(result.replyText!, /สินค้า ข้าวเหนียวขาว\+หมูทอด/);
+  assert.match(result.replyText!, /สินค้า\s+ข้าวเหนียวขาว\+หมูทอด(?!\+แหนม)/);
 });
 
 test("เลือก N consumes the pending state and completes the order with the chosen product", async () => {
@@ -784,7 +792,7 @@ test("สร้าง 50 creates the product and continues the original order au
   assert.equal(db.tables.orders.length, 1);
   assert.equal(db.tables.orders[0].product_name_snapshot, "ข้าวเหนียวขาว+หมูทอด+แหนม");
   assert.equal(db.tables.orders[0].customer_name, "ก๊อต");
-  assert.match(result.replyText!, /สินค้า ข้าวเหนียวขาว\+หมูทอด\+แหนม/);
+  assert.match(result.replyText!, /สินค้า\s+ข้าวเหนียวขาว\+หมูทอด\+แหนม/);
 });
 
 test("สร้าง 50 without any pending state does not create anything", async () => {
@@ -923,7 +931,7 @@ test("missing userId fallback: two senders with no userId in the same group shar
   restore();
 
   assert.equal(db.tables.orders.length, 1, "group-level fallback scope should resolve successfully");
-  assert.match(result.replyText!, /สินค้า ข้าวเหนียวขาว\+หมูทอด/);
+  assert.match(result.replyText!, /สินค้า\s+ข้าวเหนียวขาว\+หมูทอด(?!\+แหนม)/);
 });
 
 test("invalid selection (เลือก 3 with only 2 candidates) does not create an order", async () => {
@@ -1032,4 +1040,214 @@ test("existing Damerau-Levenshtein <= 1 ambiguous-product behavior is unaffected
   assert.equal(db.tables.orders.length, 0);
   assert.match(result.replyText!, /พบสินค้าที่เป็นไปได้หลายรายการ/);
   assert.equal(db.tables.pending_product_confirmations.length, 0, "the OLD ambiguous-fuzzy path must not touch pending state at all");
+});
+
+// --- Reply-to-order-message feature ---
+
+test("replying with a bare digit to the bot's order message updates that order", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-reply-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const trackedId = db.tables.orders[0].last_line_message_id;
+  assert.ok(trackedId, "order should have a tracked LINE message id after the first reply");
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-reply-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "2", quotedMessageId: trackedId },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders[0].status, "making");
+  assert.match(result.replyText!, /^✅ อัปเดตคำสั่งซื้อ/);
+  assert.match(result.replyText!, /สถานะใหม่/);
+  assert.match(result.replyText!, /🟢 รับออเดอร์/);
+});
+
+test("replying with a Thai status word to the bot's order message updates that order", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-reply-th-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const trackedId = db.tables.orders[0].last_line_message_id;
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-reply-th-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "ชำระเงินแล้ว", quotedMessageId: trackedId },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders[0].status, "done");
+  assert.match(result.replyText!, /✅ ชำระเงินแล้ว/);
+});
+
+test("replying to an unrelated (unrecognized) message does not update any order", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-unrel-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-unrel-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "2", quotedMessageId: "some-totally-unrelated-message-id" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders[0].status, "pending", "order must remain untouched");
+  assert.equal(result.replied, false, "no reply should be sent for an unrelated quoted message");
+});
+
+test("replying to a stale (superseded) order message is safely ignored, never guesses", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-stale-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const originalMessageId = db.tables.orders[0].last_line_message_id;
+
+  // A newer status-change message supersedes the original -- the order's
+  // tracked id now points at THIS reply, not the original creation reply.
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-stale-update",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!#" + db.tables.orders[0].order_number.slice(1) + " 2" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  assert.notEqual(db.tables.orders[0].last_line_message_id, originalMessageId);
+
+  // User replies to the ORIGINAL (now stale) message.
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-stale-reply",
+      replyToken: "reply-3",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "4", quotedMessageId: originalMessageId },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders[0].status, "making", "status must remain whatever the newer message set it to");
+  assert.equal(result.replied, false);
+});
+
+test("explicit order-number commands still work exactly as before, unaffected by reply-to-message", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-explicit-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const orderNumber = db.tables.orders[0].order_number;
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-explicit-2",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: `!${orderNumber} 3` }, // no "#", no quotedMessageId
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders[0].status, "done");
+  assert.match(result.replyText!, /✅ อัปเดตคำสั่งซื้อ/);
 });

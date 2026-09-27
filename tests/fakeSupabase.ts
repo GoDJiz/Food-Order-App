@@ -157,6 +157,12 @@ class FakeQueryBuilder {
       resolve({ data: null, error: null });
       return;
     }
+    if (this.mode === "update" && this.updateValues) {
+      const rows = this.matching();
+      rows.forEach((row) => Object.assign(row, this.updateValues));
+      resolve({ data: rows, error: null });
+      return;
+    }
     if (this.countMode) {
       resolve({ data: null, error: null, count: this.matching().length });
       return;

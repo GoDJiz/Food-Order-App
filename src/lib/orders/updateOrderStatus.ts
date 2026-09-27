@@ -62,3 +62,26 @@ export async function updateOrderStatusById(
 
   return data as OrderRecord;
 }
+
+/**
+ * Records the LINE message id of the most recent bot message that
+ * displayed this order's full state. Used only to support "reply to this
+ * order message" -- never touches any business column (product, customer,
+ * quantity, prices, status). Best-effort: a failure here should not break
+ * the reply that was already sent to the user, so callers should treat
+ * this as non-critical (log and continue rather than surface an error).
+ */
+export async function setOrderLastMessageId(
+  supabase: SupabaseClient,
+  orderId: string,
+  messageId: string
+): Promise<void> {
+  const { error } = await supabase
+    .from("orders")
+    .update({ last_line_message_id: messageId })
+    .eq("id", orderId);
+
+  if (error) {
+    throw new Error(`Failed to record LINE message id for order ${orderId}: ${error.message}`);
+  }
+}

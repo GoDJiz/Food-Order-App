@@ -42,7 +42,28 @@ export function formatOrderNumber(businessDate: string, seq: number): string {
 
 /**
  * Validates that a string looks like a well-formed order number, e.g. "#260916-0001".
+ * Canonical/stored form always includes the "#" -- this checks that exact form.
  */
 export function isValidOrderNumberFormat(value: string): boolean {
   return /^#\d{6}-\d{4}$/.test(value);
+}
+
+/**
+ * Looser check used only for routing an incoming LINE message: matches the
+ * order-number "core" shape with or without a leading "#", e.g. both
+ * "260916-0001" and "#260916-0001". Typing "#" on a phone keyboard can be
+ * inconvenient, so the "#" is optional on input while remaining mandatory
+ * in the canonical stored/displayed form.
+ */
+export function looksLikeOrderNumber(value: string): boolean {
+  return /^#?\d{6}-\d{4}$/.test(value);
+}
+
+/**
+ * Normalizes an order-number-like string to its canonical "#YYMMDD-NNNN"
+ * form by adding the "#" if it's missing. Does not validate the shape --
+ * call looksLikeOrderNumber() first.
+ */
+export function normalizeOrderNumber(value: string): string {
+  return value.startsWith("#") ? value : `#${value}`;
 }

@@ -42,10 +42,29 @@ export async function getDailySummary(
     totalCost += row.cost_price_snapshot * row.quantity;
   }
 
+  // Orders don't snapshot a unit (only price/cost are snapshotted), so this
+  // is a best-effort, live lookup against the CURRENT product catalog for
+  // display purposes only -- purely cosmetic (e.g. "5 ขวด" instead of just
+  // "5"), never used for any calculation. If a product's unit changed
+  // since some of today's orders were placed, or the product was removed
+  // entirely, the line still shows correctly, just without a unit suffix.
+  const { data: productRows, error: productError } = await supabase
+    .from("products")
+    .select("name, unit");
+
+  if (productError) {
+    throw new Error(`Failed to load product units for daily summary: ${productError.message}`);
+  }
+
+  const unitByProductName = new Map<string, string>();
+  for (const p of (productRows ?? []) as Array<{ name: string; unit: string }>) {
+    unitByProductName.set(p.name, p.unit ?? "");
+  }
+
   const lines: DailySummaryLine[] = Array.from(byProduct.entries()).map(([productName, quantity]) => ({
     productName,
     quantity,
-    unit: "",
+    unit: unitByProductName.get(productName) ?? "",
   }));
 
   return {

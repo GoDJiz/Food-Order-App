@@ -1,4 +1,4 @@
-import { isValidOrderNumberFormat } from "@/lib/date";
+import { isValidOrderNumberFormat, looksLikeOrderNumber, normalizeOrderNumber } from "@/lib/date";
 import { isValidStatusCode } from "@/lib/orders/status";
 
 export type ParsedCommand =
@@ -32,21 +32,35 @@ export function parseOrderMessage(rawText: string): ParsedCommand {
 
   const body = text.slice(1).trim();
 
-  if (body.toLowerCase() === "summary") {
+  if (isSummaryAlias(body)) {
     return { kind: "summary" };
   }
 
-  if (body.startsWith("#")) {
+  const firstToken = body.split(/\s+/)[0] ?? "";
+  if (looksLikeOrderNumber(firstToken)) {
     return parseOrderNumberCommand(body);
   }
 
   return tokenizeNewOrderCommand(body);
 }
 
+// "!summary" stays supported for backward compatibility; the Thai aliases
+// behave identically. Kept as an explicit, small allowlist rather than a
+// generic alias table, per "do not invent unnecessary new commands."
+function isSummaryAlias(body: string): boolean {
+  const normalized = body.trim().normalize("NFC");
+  return (
+    normalized.toLowerCase() === "summary" ||
+    normalized === "สรุป" ||
+    normalized === "สรุปออเดอร์"
+  );
+}
+
 function parseOrderNumberCommand(body: string): ParsedCommand {
-  // Split into at most 2 tokens: "#260916-0001" and optionally a status digit.
+  // Split into at most 2 tokens: an order number ("#260916-0001" or
+  // "260916-0001") and optionally a status digit.
   const tokens = body.split(/\s+/).filter(Boolean);
-  const orderNumber = tokens[0];
+  const orderNumber = normalizeOrderNumber(tokens[0]);
 
   if (!isValidOrderNumberFormat(orderNumber)) {
     return { kind: "invalid_order_format" };

@@ -282,3 +282,50 @@ test("once a clear whole-token quantity exists, a digit inside customer text is 
     assert.equal(r.quantity, 1);
   }
 });
+
+// --- "#" optional for order-number commands, backward compatibility ---
+
+test("order lookup works with # (backward compatible)", () => {
+  const r = parseOrderMessage("!#260925-0001");
+  assert.deepEqual(r, { kind: "order_lookup", orderNumber: "#260925-0001" });
+});
+
+test("order lookup works WITHOUT # (new)", () => {
+  const r = parseOrderMessage("!260925-0001");
+  assert.deepEqual(r, { kind: "order_lookup", orderNumber: "#260925-0001" });
+});
+
+test("order status change works with # (backward compatible)", () => {
+  const r = parseOrderMessage("!#260925-0001 2");
+  assert.deepEqual(r, { kind: "order_status_change", orderNumber: "#260925-0001", statusCode: "2" });
+});
+
+test("order status change works WITHOUT # (new)", () => {
+  const r = parseOrderMessage("!260925-0001 2");
+  assert.deepEqual(r, { kind: "order_status_change", orderNumber: "#260925-0001", statusCode: "2" });
+});
+
+test("malformed order number without # is still rejected", () => {
+  const r = parseOrderMessage("!26092-0001"); // wrong digit count, no #
+  assert.equal(r.kind, "invalid_order_format");
+});
+
+test("malformed order number without # and extra tokens is still rejected", () => {
+  const r = parseOrderMessage("!260925-0001 2 extra");
+  assert.equal(r.kind, "invalid_order_format");
+});
+
+// --- Thai !summary aliases ---
+
+test("!สรุป behaves exactly like !summary", () => {
+  assert.deepEqual(parseOrderMessage("!สรุป"), { kind: "summary" });
+});
+
+test("!สรุปออเดอร์ behaves exactly like !summary", () => {
+  assert.deepEqual(parseOrderMessage("!สรุปออเดอร์"), { kind: "summary" });
+});
+
+test("English !summary still works unchanged (backward compatible)", () => {
+  assert.deepEqual(parseOrderMessage("!summary"), { kind: "summary" });
+  assert.deepEqual(parseOrderMessage("!Summary"), { kind: "summary" });
+});

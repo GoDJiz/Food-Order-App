@@ -13,13 +13,14 @@ import {
 } from "@/lib/orders/pendingConfirmation";
 import { listProducts, createProduct } from "@/lib/products/products";
 import type { ProductRecord } from "@/lib/orders/getActiveProductByName";
-import { getOrderByNumber } from "@/lib/orders/getOrderByNumber";
-import { updateOrderStatus } from "@/lib/orders/updateOrderStatus";
+import { getOrderByNumber, getOrderByLastMessageId } from "@/lib/orders/getOrderByNumber";
+import { updateOrderStatus, updateOrderStatusById, setOrderLastMessageId } from "@/lib/orders/updateOrderStatus";
 import { createOrder } from "@/lib/orders/createOrder";
 import { getDailySummary } from "@/lib/orders/getDailySummary";
-import { statusFromCode } from "@/lib/orders/status";
+import { statusFromCode, parseBareStatusReply } from "@/lib/orders/status";
 import {
   buildOrderSummaryReply,
+  buildOrderUpdatedReply,
   buildInvalidOrderFormatReply,
   buildOrderNotFoundReply,
   buildInvalidStatusCodeReply,
@@ -41,7 +42,7 @@ export interface LineEvent {
   webhookEventId: string;
   replyToken?: string;
   source?: { groupId?: string; userId?: string; type?: string };
-  message?: { type: string; text?: string };
+  message?: { type: string; text?: string; quotedMessageId?: string };
 }
 
 /**
@@ -66,6 +67,12 @@ export async function recordEventOnce(
   throw new Error(`Failed to record LINE event ${eventId}: ${error.message}`);
 }
 
+/** Result of any branch that resolves to a reply, optionally tied to an order. */
+interface ReplyOutcome {
+  replyText: string;
+  orderId: string | null;
+}
+
 export async function handleEvent(
   event: LineEvent,
   supabase: SupabaseClient,
@@ -88,6 +95,21 @@ export async function handleEvent(
     return { replied: false }; // nothing we can reply to
   }
 
+  // Reply-to-order-message: only engaged when this message is itself a
+  // LINE reply/quote (quotedMessageId present) AND we have an order whose
+  // last known bot message id matches it AND the reply text is a bare
+  // status code/word. Any one of those not holding true falls straight
+  // through to the rest of the normal command parsing below -- a reply to
+  // an unrelated message, or a reply whose text isn't a status word, never
+  // touches an order.
+  if (event.message.quotedMessageId) {
+    const quotedOutcome = await tryHandleQuotedStatusReply(supabase, event.message.quotedMessageId, text);
+    if (quotedOutcome) {
+      await sendAndTrack(event.replyToken, quotedOutcome, supabase, channelAccessToken);
+      return { replied: true, replyText: quotedOutcome.replyText };
+    }
+  }
+
   // Pending-confirmation replies (ใช่ / เลือก N / สร้าง <price>) are checked
   // BEFORE the existing "!"-prefixed command parsing. They intentionally
   // don't use "!" (see parseConfirmationCommand.ts), which is safe because
@@ -96,15 +118,10 @@ export async function handleEvent(
   // through to today's unchanged "not_a_command" handling below.
   const confirmationCommand = parseConfirmationCommand(text);
   if (confirmationCommand) {
-    const replyText = await handlePendingConfirmationReply(
-      supabase,
-      groupId,
-      userId,
-      confirmationCommand
-    );
-    if (replyText !== null) {
-      await replyToLine(event.replyToken, replyText, channelAccessToken);
-      return { replied: true, replyText };
+    const outcome = await handlePendingConfirmationReply(supabase, groupId, userId, confirmationCommand);
+    if (outcome !== null) {
+      await sendAndTrack(event.replyToken, outcome, supabase, channelAccessToken);
+      return { replied: true, replyText: outcome.replyText };
     }
     // No pending confirmation existed and the text also isn't a valid
     // order/status/summary command -- fall through exactly as an ordinary
@@ -118,7 +135,7 @@ export async function handleEvent(
     return { replied: false }; // ordinary group chat message, not addressed to the bot
   }
 
-  let replyText: string;
+  let outcome: ReplyOutcome;
 
   switch (command.kind) {
     case "new_order_tokens": {
@@ -129,7 +146,7 @@ export async function handleEvent(
       if (!match.matched) {
         if (match.reason === "ambiguous") {
           // Existing Damerau-Levenshtein <= 1 ambiguity -- unchanged.
-          replyText = buildAmbiguousProductReply(match.candidates);
+          outcome = { replyText: buildAmbiguousProductReply(match.candidates), orderId: null };
           break;
         }
 
@@ -152,7 +169,7 @@ export async function handleEvent(
             quantity: command.quantity,
             customerName: customerForPending,
           });
-          replyText = buildNoSimilarProductReply(attemptedName);
+          outcome = { replyText: buildNoSimilarProductReply(attemptedName), orderId: null };
         } else if (similar.kind === "single") {
           await createPendingConfirmation(supabase, {
             groupId,
@@ -163,7 +180,7 @@ export async function handleEvent(
             quantity: command.quantity,
             customerName: customerForPending,
           });
-          replyText = buildSimilarProductSingleReply(attemptedName, similar.product.name);
+          outcome = { replyText: buildSimilarProductSingleReply(attemptedName, similar.product.name), orderId: null };
         } else {
           await createPendingConfirmation(supabase, {
             groupId,
@@ -174,10 +191,10 @@ export async function handleEvent(
             quantity: command.quantity,
             customerName: customerForPending,
           });
-          replyText = buildSimilarProductMultipleReply(
-            attemptedName,
-            similar.candidates.map((p) => p.name)
-          );
+          outcome = {
+            replyText: buildSimilarProductMultipleReply(attemptedName, similar.candidates.map((p) => p.name)),
+            orderId: null,
+          };
         }
         break;
       }
@@ -196,116 +213,174 @@ export async function handleEvent(
         customer,
         lineGroupId: groupId || null,
       });
-      replyText = buildOrderSummaryReply(order, match.product.unit);
+      outcome = { replyText: buildOrderSummaryReply(order, match.product.unit), orderId: order.id };
       break;
     }
 
     case "order_lookup": {
       const order = await getOrderByNumber(supabase, command.orderNumber);
-      replyText = order
-        ? buildOrderSummaryReply(order)
-        : buildOrderNotFoundReply(command.orderNumber);
+      outcome = order
+        ? { replyText: buildOrderSummaryReply(order), orderId: order.id }
+        : { replyText: buildOrderNotFoundReply(command.orderNumber), orderId: null };
       break;
     }
 
     case "order_status_change": {
       const existing = await getOrderByNumber(supabase, command.orderNumber);
       if (!existing) {
-        replyText = buildOrderNotFoundReply(command.orderNumber);
+        outcome = { replyText: buildOrderNotFoundReply(command.orderNumber), orderId: null };
         break;
       }
       const newStatus = statusFromCode(command.statusCode);
       if (!newStatus) {
-        replyText = buildInvalidStatusCodeReply();
+        outcome = { replyText: buildInvalidStatusCodeReply(), orderId: null };
         break;
       }
       const updated = await updateOrderStatus(supabase, command.orderNumber, newStatus);
-      replyText = buildOrderSummaryReply(updated);
+      outcome = { replyText: buildOrderUpdatedReply(updated), orderId: updated.id };
       break;
     }
 
     case "summary": {
       const summary = await getDailySummary(supabase);
-      replyText = buildDailySummaryReply(summary);
+      outcome = { replyText: buildDailySummaryReply(summary), orderId: null };
       break;
     }
 
     case "invalid_order_format":
-      replyText = buildInvalidOrderFormatReply();
+      outcome = { replyText: buildInvalidOrderFormatReply(), orderId: null };
       break;
 
     case "invalid_status_code":
-      replyText = buildInvalidStatusCodeReply();
+      outcome = { replyText: buildInvalidStatusCodeReply(), orderId: null };
       break;
 
     case "ambiguous_quantity":
-      replyText = buildAmbiguousQuantityReply();
+      outcome = { replyText: buildAmbiguousQuantityReply(), orderId: null };
       break;
 
     case "invalid_quantity":
-      replyText = buildInvalidQuantityReply(command.reason);
+      outcome = { replyText: buildInvalidQuantityReply(command.reason), orderId: null };
       break;
 
     default:
       return { replied: false };
   }
 
-  await replyToLine(event.replyToken, replyText, channelAccessToken);
-  return { replied: true, replyText };
+  await sendAndTrack(event.replyToken, outcome, supabase, channelAccessToken);
+  return { replied: true, replyText: outcome.replyText };
+}
+
+/**
+ * Sends the reply via LINE and, when the outcome is tied to a specific
+ * order, persists the sent message's id onto that order so a later reply
+ * to THIS message can be matched back to it. Best-effort: if capturing the
+ * message id fails for any reason, the reply the user already received is
+ * unaffected -- we don't let a tracking failure surface as a user-facing
+ * error for a message that was already successfully sent.
+ */
+async function sendAndTrack(
+  replyToken: string,
+  outcome: ReplyOutcome,
+  supabase: SupabaseClient,
+  channelAccessToken: string
+): Promise<void> {
+  const { sentMessageId } = await replyToLine(replyToken, outcome.replyText, channelAccessToken);
+  if (sentMessageId && outcome.orderId) {
+    await setOrderLastMessageId(supabase, outcome.orderId, sentMessageId).catch(() => {
+      // Non-critical -- see docstring above.
+    });
+  }
+}
+
+/**
+ * Handles a LINE reply/quote whose text is a bare status code or Thai
+ * status word (no "!" prefix), scoped strictly to messages that are
+ * themselves quoting a specific earlier bot order message we recognize.
+ * Returns null whenever the reply shouldn't be treated as a status update
+ * at all -- callers fall through to normal command parsing in that case.
+ */
+async function tryHandleQuotedStatusReply(
+  supabase: SupabaseClient,
+  quotedMessageId: string,
+  text: string
+): Promise<ReplyOutcome | null> {
+  const statusCode = parseBareStatusReply(text);
+  if (!statusCode) {
+    return null; // not a bare status reply -- not our concern, fall through.
+  }
+
+  const order = await getOrderByLastMessageId(supabase, quotedMessageId);
+  if (!order) {
+    // The quoted message isn't one we recognize as a tracked order message
+    // (an unrelated message, or one from before this feature existed, or
+    // already superseded by a newer status message). Never guess -- fall
+    // through, which for a bare "2"/"รับออเดอร์" with no "!" and no other
+    // match results in no reply at all, same as today.
+    return null;
+  }
+
+  const newStatus = statusFromCode(statusCode);
+  if (!newStatus) {
+    return null; // unreachable given parseBareStatusReply's contract, but exhaustive.
+  }
+
+  const updated = await updateOrderStatusById(supabase, order.id, newStatus);
+  return { replyText: buildOrderUpdatedReply(updated), orderId: updated.id };
 }
 
 /**
  * Resolves a ใช่ / เลือก N / สร้าง <price> reply against the active pending
- * confirmation for this (group, user) scope, if any. Returns the reply
- * text to send, or null if there was nothing pending AND the raw text
- * doesn't otherwise look like a confirmation attempt worth responding to
- * (so the caller can silently fall through, matching how every other
- * unaddressed message in this system is handled).
+ * confirmation for this (group, user) scope, if any. Returns null if there
+ * was nothing pending AND the raw text doesn't otherwise look like a
+ * confirmation attempt worth responding to (so the caller can silently
+ * fall through, matching how every other unaddressed message in this
+ * system is handled).
  */
 async function handlePendingConfirmationReply(
   supabase: SupabaseClient,
   groupId: string,
   userId: string | null,
   command: NonNullable<ReturnType<typeof parseConfirmationCommand>>
-): Promise<string | null> {
+): Promise<ReplyOutcome | null> {
   const pending = await getActivePendingConfirmation(supabase, groupId, userId);
 
   if (!pending) {
     // Distinguishing "expired" from "never existed" is intentionally not
     // done here -- both cases get the same reply, per the approved design.
-    return buildNoPendingConfirmationReply();
+    return { replyText: buildNoPendingConfirmationReply(), orderId: null };
   }
 
   switch (command.kind) {
     case "confirm_yes": {
       if (pending.mode !== "confirm" || pending.candidates.length !== 1) {
-        return buildNoPendingConfirmationReply();
+        return { replyText: buildNoPendingConfirmationReply(), orderId: null };
       }
       return resolveWithExistingProduct(supabase, pending, pending.candidates[0].id);
     }
 
     case "confirm_select": {
       if (pending.mode !== "select") {
-        return buildNoPendingConfirmationReply();
+        return { replyText: buildNoPendingConfirmationReply(), orderId: null };
       }
       const chosen = pending.candidates[command.index - 1];
       if (!chosen) {
         // Invalid selection -- pending state is left intact so the user
         // can retry with a valid number within the expiry window.
-        return buildInvalidSelectionReply(pending.candidates.length);
+        return { replyText: buildInvalidSelectionReply(pending.candidates.length), orderId: null };
       }
       return resolveWithExistingProduct(supabase, pending, chosen.id);
     }
 
     case "confirm_create": {
       if (pending.mode !== "create") {
-        return buildNoPendingConfirmationReply();
+        return { replyText: buildNoPendingConfirmationReply(), orderId: null };
       }
       const price = parsePriceArgument(command.rawPrice);
       if (price === null) {
         // Invalid price -- pending state is left intact, same reasoning
         // as an invalid selection above.
-        return buildInvalidPriceReply();
+        return { replyText: buildInvalidPriceReply(), orderId: null };
       }
       const product = await createProduct(supabase, {
         name: pending.raw_query,
@@ -321,11 +396,11 @@ async function handlePendingConfirmationReply(
         customer: pending.customer_name,
         lineGroupId: groupId || null,
       });
-      return buildOrderSummaryReply(order, product.unit);
+      return { replyText: buildOrderSummaryReply(order, product.unit), orderId: order.id };
     }
 
     default:
-      return buildNoPendingConfirmationReply();
+      return { replyText: buildNoPendingConfirmationReply(), orderId: null };
   }
 }
 
@@ -333,7 +408,7 @@ async function resolveWithExistingProduct(
   supabase: SupabaseClient,
   pending: PendingConfirmationRecord,
   productId: string
-): Promise<string> {
+): Promise<ReplyOutcome> {
   const products = await listProducts(supabase);
   const product = products.find((p: ProductRecord) => p.id === productId);
 
@@ -343,7 +418,7 @@ async function resolveWithExistingProduct(
     // The product was deactivated/removed in the window between the
     // proposal and the confirmation -- treat it the same as "not found"
     // rather than creating an order against a product that's gone.
-    return buildProductNotFoundReply(pending.raw_query);
+    return { replyText: buildProductNotFoundReply(pending.raw_query), orderId: null };
   }
 
   const order = await createOrder(supabase, {
@@ -352,5 +427,5 @@ async function resolveWithExistingProduct(
     customer: pending.customer_name,
     lineGroupId: pending.line_group_id || null,
   });
-  return buildOrderSummaryReply(order, product.unit);
+  return { replyText: buildOrderSummaryReply(order, product.unit), orderId: order.id };
 }

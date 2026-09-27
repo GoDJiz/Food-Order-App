@@ -35,3 +35,27 @@ export function statusFromCode(code: string): OrderStatus | null {
 export function thaiLabelFor(status: OrderStatus): string {
   return STATUS_LABELS_TH[status];
 }
+
+// Reverse lookup: Thai status word -> status code. Used only for the
+// reply-to-order-message feature, where a bare reply of "2" or "รับออเดอร์"
+// (no "!" prefix) is accepted -- but only when it's confirmed to be a
+// reply to a specific stored order message (see handleLineEvent.ts).
+const THAI_LABEL_TO_CODE: Record<string, "1" | "2" | "3" | "4"> = {
+  "สั่งซื้อ": "1",
+  "รับออเดอร์": "2",
+  "ชำระเงินแล้ว": "3",
+  "ยกเลิก": "4",
+};
+
+/**
+ * Parses a bare status reply -- either a digit "1"-"4" or one of the four
+ * Thai status words, trimmed and NFC-normalized. Returns null for
+ * anything else. Deliberately strict (exact match only, no partial/fuzzy
+ * matching) since this is only ever invoked in the narrow, already-safe
+ * context of a confirmed reply to a specific order message.
+ */
+export function parseBareStatusReply(rawText: string): "1" | "2" | "3" | "4" | null {
+  const text = rawText.trim().normalize("NFC");
+  if (isValidStatusCode(text)) return text;
+  return THAI_LABEL_TO_CODE[text] ?? null;
+}

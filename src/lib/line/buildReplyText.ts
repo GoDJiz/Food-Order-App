@@ -1,5 +1,12 @@
 import type { OrderRecord } from "@/lib/orders/getOrderByNumber";
-import { thaiLabelFor } from "@/lib/orders/status";
+import { thaiLabelFor, type OrderStatus } from "@/lib/orders/status";
+
+const STATUS_EMOJI: Record<OrderStatus, string> = {
+  pending: "🟡",
+  making: "🟢",
+  done: "✅",
+  cancelled: "🔴",
+};
 
 /**
  * Every order-related reply (new order / status change / lookup) shows the
@@ -9,19 +16,43 @@ import { thaiLabelFor } from "@/lib/orders/status";
  * is self-contained so the newest message is always the full truth, and
  * staff never need to scroll up to reconstruct state.
  *
- * Format matches the approved example exactly:
- * "สรุปคำสั่งซื้อ เลขที่ #260916-0001 สินค้า น้ำส้ม จำนวน 1 ขวด ชื่อลูกค้า พี่ไก่ สถานะ สั่งซื้อ"
+ * Multi-line, one field per line, for easy scanning on a phone screen --
+ * these are real "\n" line breaks sent to the LINE API, not
+ * space-separated text relying on client-side wrapping.
  */
 export function buildOrderSummaryReply(order: OrderRecord, unit?: string): string {
   const unitPart = unit ? ` ${unit}` : "";
   const customerText = order.customer_name && order.customer_name.trim() ? order.customer_name : "-";
-  return (
-    `สรุปคำสั่งซื้อ เลขที่ ${order.order_number} ` +
-    `สินค้า ${order.product_name_snapshot} ` +
-    `จำนวน ${order.quantity}${unitPart} ` +
-    `ชื่อลูกค้า ${customerText} ` +
-    `สถานะ ${thaiLabelFor(order.status)}`
-  );
+  return [
+    "📦 คำสั่งซื้อ",
+    `เลขที่  ${order.order_number}`,
+    `สินค้า  ${order.product_name_snapshot}`,
+    `จำนวน  ${order.quantity}${unitPart}`,
+    `ลูกค้า  ${customerText}`,
+    "สถานะ",
+    `${STATUS_EMOJI[order.status]} ${thaiLabelFor(order.status)}`,
+  ].join("\n");
+}
+
+/**
+ * Same information as buildOrderSummaryReply, but for a status CHANGE
+ * specifically (via "!#order code", a bare reply, or a quoted-message
+ * reply) -- distinct header and "สถานะใหม่" (new status) label make it
+ * visually clear at a glance that this message represents an update to an
+ * existing order, not a brand-new one.
+ */
+export function buildOrderUpdatedReply(order: OrderRecord, unit?: string): string {
+  const unitPart = unit ? ` ${unit}` : "";
+  const customerText = order.customer_name && order.customer_name.trim() ? order.customer_name : "-";
+  return [
+    "✅ อัปเดตคำสั่งซื้อ",
+    `เลขที่  ${order.order_number}`,
+    `สินค้า  ${order.product_name_snapshot}`,
+    `จำนวน  ${order.quantity}${unitPart}`,
+    `ลูกค้า  ${customerText}`,
+    "สถานะใหม่",
+    `${STATUS_EMOJI[order.status]} ${thaiLabelFor(order.status)}`,
+  ].join("\n");
 }
 
 export function buildInvalidOrderFormatReply(): string {
@@ -119,19 +150,20 @@ export interface DailySummaryInput {
 }
 
 /**
- * Short summary reply for "!summary" — intentionally brief per approved
- * design (not the full per-order detail used by order commands).
+ * Compact, structured summary reply for "!summary" / "!สรุป" / "!สรุปออเดอร์"
+ * -- key numbers first (each with its own emoji/label/line), then a short
+ * bulleted per-product breakdown. Real line breaks throughout.
  */
 export function buildDailySummaryReply(input: DailySummaryInput): string {
-  const productLines = input.lines
-    .map((l) => `${l.productName} ${l.quantity} ${l.unit}`.trim())
-    .join("\n");
+  const productLines = input.lines.map((l) => `• ${l.productName}  ${l.quantity} ${l.unit}`.trimEnd());
 
-  return (
-    `📦 สรุปวันนี้\n` +
-    `${productLines}\n\n` +
-    `รวม: ${input.totalOrders} ออเดอร์ / ${input.totalItems} รายการ\n` +
-    `ยอดขาย: ฿${input.totalSales.toLocaleString("en-US")}\n` +
-    `กำไร: ฿${input.totalProfit.toLocaleString("en-US")}`
-  );
+  return [
+    "📊 สรุปวันนี้",
+    `🧾 ออเดอร์   ${input.totalOrders} รายการ`,
+    `📦 จำนวน    ${input.totalItems} ชิ้น`,
+    `💰 ยอดขาย   ฿${input.totalSales.toLocaleString("en-US")}`,
+    `📈 กำไร     ฿${input.totalProfit.toLocaleString("en-US")}`,
+    "สินค้า",
+    ...productLines,
+  ].join("\n");
 }
