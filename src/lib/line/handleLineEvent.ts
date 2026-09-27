@@ -1,10 +1,14 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { replyToLine } from "@/lib/line/replyMessage";
-import { parseOrderMessage } from "@/lib/line/parseOrderMessage";
+import { parseOrderMessage, type ParsedCommand } from "@/lib/line/parseOrderMessage";
 import { parseConfirmationCommand, parsePriceArgument } from "@/lib/line/parseConfirmationCommand";
 import { matchProduct } from "@/lib/orders/matchProduct";
 import { extractCustomer } from "@/lib/orders/extractCustomer";
 import { searchSimilarProducts } from "@/lib/orders/similarProducts";
+import {
+  classifyAsMultiLineOrders,
+  type ClassifiedLine,
+} from "@/lib/line/splitOrderLines";
 import {
   getActivePendingConfirmation,
   createPendingConfirmation,
@@ -35,6 +39,7 @@ import {
   buildNoPendingConfirmationReply,
   buildInvalidSelectionReply,
   buildInvalidPriceReply,
+  buildMultiLineOrderReply,
 } from "@/lib/line/buildReplyText";
 
 export interface LineEvent {
@@ -71,6 +76,13 @@ export async function recordEventOnce(
 interface ReplyOutcome {
   replyText: string;
   orderId: string | null;
+}
+
+/** ReplyOutcome plus whether an order was actually created -- used by the
+ * multi-line order batch handler to build its per-line success/failure
+ * summary (rule 10). Single-line callers ignore the extra field. */
+interface OrderLineOutcome extends ReplyOutcome {
+  success: boolean;
 }
 
 export async function handleEvent(
@@ -135,85 +147,35 @@ export async function handleEvent(
     return { replied: false }; // ordinary group chat message, not addressed to the bot
   }
 
+  // A message that looks like a single new-order attempt (or a Stage-1
+  // error) is also checked for multi-line batching -- this only actually
+  // engages when there are 2+ non-blank lines AND the first one starts
+  // with "!" (see classifyAsMultiLineOrders' docstring), so a genuinely
+  // single-line message is completely unaffected and falls through to the
+  // switch below exactly as before.
+  if (
+    command.kind === "new_order_tokens" ||
+    command.kind === "invalid_order_format" ||
+    command.kind === "ambiguous_quantity" ||
+    command.kind === "invalid_quantity"
+  ) {
+    const classifiedLines = classifyAsMultiLineOrders(text);
+    if (classifiedLines) {
+      const replyText = await handleMultiLineOrders(classifiedLines, groupId, userId, supabase);
+      await replyToLine(event.replyToken, replyText, channelAccessToken);
+      // Multi-line batches intentionally don't track a single order's
+      // last_line_message_id -- see handleMultiLineOrders' docstring.
+      return { replied: true, replyText };
+    }
+  }
+
   let outcome: ReplyOutcome;
 
   switch (command.kind) {
     case "new_order_tokens": {
-      // Stage 2: resolve the product against the active catalog.
-      const activeProducts = await listProducts(supabase);
-      const match = matchProduct(command.tokens, command.qtyIndex, activeProducts);
-
-      if (!match.matched) {
-        if (match.reason === "ambiguous") {
-          // Existing Damerau-Levenshtein <= 1 ambiguity -- unchanged.
-          outcome = { replyText: buildAmbiguousProductReply(match.candidates), orderId: null };
-          break;
-        }
-
-        // Existing exact + distance<=1 passes found nothing. Only now does
-        // the NEW similarity tier run, per the approved matching order.
-        const attemptedName = command.tokens.slice(0, command.qtyIndex).join(" ");
-        // The entire pre-quantity span is the attempted product text here
-        // (nothing matched at any prefix length), so it is excluded in
-        // full -- passing qtyIndex (not 0) as the "consumed" count.
-        const customerForPending = extractCustomer(command.tokens, command.qtyIndex, command.qtyIndex, "");
-        const similar = searchSimilarProducts(attemptedName, activeProducts);
-
-        if (similar.kind === "none") {
-          await createPendingConfirmation(supabase, {
-            groupId,
-            userId,
-            mode: "create",
-            rawQuery: attemptedName,
-            candidates: [],
-            quantity: command.quantity,
-            customerName: customerForPending,
-          });
-          outcome = { replyText: buildNoSimilarProductReply(attemptedName), orderId: null };
-        } else if (similar.kind === "single") {
-          await createPendingConfirmation(supabase, {
-            groupId,
-            userId,
-            mode: "confirm",
-            rawQuery: attemptedName,
-            candidates: [{ id: similar.product.id, name: similar.product.name }],
-            quantity: command.quantity,
-            customerName: customerForPending,
-          });
-          outcome = { replyText: buildSimilarProductSingleReply(attemptedName, similar.product.name), orderId: null };
-        } else {
-          await createPendingConfirmation(supabase, {
-            groupId,
-            userId,
-            mode: "select",
-            rawQuery: attemptedName,
-            candidates: similar.candidates.map((p) => ({ id: p.id, name: p.name })),
-            quantity: command.quantity,
-            customerName: customerForPending,
-          });
-          outcome = {
-            replyText: buildSimilarProductMultipleReply(attemptedName, similar.candidates.map((p) => p.name)),
-            orderId: null,
-          };
-        }
-        break;
-      }
-
-      // Stage 3: everything else is customer text, minus one unit token.
-      const customer = extractCustomer(
-        command.tokens,
-        command.qtyIndex,
-        match.consumedCount,
-        match.product.unit
-      );
-
-      const order = await createOrder(supabase, {
-        product: match.product,
-        quantity: command.quantity,
-        customer,
-        lineGroupId: groupId || null,
+      outcome = await processNewOrderCommand(command, groupId, userId, supabase, {
+        allowPendingConfirmation: true,
       });
-      outcome = { replyText: buildOrderSummaryReply(order, match.product.unit), orderId: order.id };
       break;
     }
 
@@ -269,6 +231,162 @@ export async function handleEvent(
 
   await sendAndTrack(event.replyToken, outcome, supabase, channelAccessToken);
   return { replied: true, replyText: outcome.replyText };
+}
+
+/**
+ * Resolves and (if matched) creates a single new order -- this is the
+ * exact logic behind the single-line "new_order_tokens" case, factored
+ * out so the multi-line batch handler below can reuse it verbatim rather
+ * than duplicating product matching, quantity handling, fuzzy matching,
+ * unit stripping, or customer extraction (none of which are touched here
+ * at all -- this function only orchestrates calls into them).
+ *
+ * When allowPendingConfirmation is false (multi-line batch mode), a
+ * product that doesn't exactly/fuzzy-match is treated as a simple failed
+ * line rather than starting the similar-product-confirmation
+ * conversation -- a multi-order message gets one immediate combined
+ * reply, not N concurrent pending conversations. The person can always
+ * resend that one line alone to get the full similar-product guidance.
+ */
+async function processNewOrderCommand(
+  command: Extract<ParsedCommand, { kind: "new_order_tokens" }>,
+  groupId: string,
+  userId: string | null,
+  supabase: SupabaseClient,
+  opts: { allowPendingConfirmation: boolean }
+): Promise<OrderLineOutcome> {
+  // Stage 2: resolve the product against the active catalog.
+  const activeProducts = await listProducts(supabase);
+  const match = matchProduct(command.tokens, command.qtyIndex, activeProducts);
+
+  if (!match.matched) {
+    if (match.reason === "ambiguous") {
+      // Existing Damerau-Levenshtein <= 1 ambiguity -- unchanged.
+      return { replyText: buildAmbiguousProductReply(match.candidates), orderId: null, success: false };
+    }
+
+    const attemptedName = command.tokens.slice(0, command.qtyIndex).join(" ");
+
+    if (!opts.allowPendingConfirmation) {
+      return { replyText: buildProductNotFoundReply(attemptedName), orderId: null, success: false };
+    }
+
+    // Existing exact + distance<=1 passes found nothing. Only now does
+    // the NEW similarity tier run, per the approved matching order.
+    // The entire pre-quantity span is the attempted product text here
+    // (nothing matched at any prefix length), so it is excluded in
+    // full -- passing qtyIndex (not 0) as the "consumed" count.
+    const customerForPending = extractCustomer(command.tokens, command.qtyIndex, command.qtyIndex, "");
+    const similar = searchSimilarProducts(attemptedName, activeProducts);
+
+    if (similar.kind === "none") {
+      await createPendingConfirmation(supabase, {
+        groupId,
+        userId,
+        mode: "create",
+        rawQuery: attemptedName,
+        candidates: [],
+        quantity: command.quantity,
+        customerName: customerForPending,
+      });
+      return { replyText: buildNoSimilarProductReply(attemptedName), orderId: null, success: false };
+    }
+
+    if (similar.kind === "single") {
+      await createPendingConfirmation(supabase, {
+        groupId,
+        userId,
+        mode: "confirm",
+        rawQuery: attemptedName,
+        candidates: [{ id: similar.product.id, name: similar.product.name }],
+        quantity: command.quantity,
+        customerName: customerForPending,
+      });
+      return {
+        replyText: buildSimilarProductSingleReply(attemptedName, similar.product.name),
+        orderId: null,
+        success: false,
+      };
+    }
+
+    await createPendingConfirmation(supabase, {
+      groupId,
+      userId,
+      mode: "select",
+      rawQuery: attemptedName,
+      candidates: similar.candidates.map((p) => ({ id: p.id, name: p.name })),
+      quantity: command.quantity,
+      customerName: customerForPending,
+    });
+    return {
+      replyText: buildSimilarProductMultipleReply(attemptedName, similar.candidates.map((p) => p.name)),
+      orderId: null,
+      success: false,
+    };
+  }
+
+  // Stage 3: everything else is customer text, minus one unit token.
+  const customer = extractCustomer(command.tokens, command.qtyIndex, match.consumedCount, match.product.unit);
+
+  const order = await createOrder(supabase, {
+    product: match.product,
+    quantity: command.quantity,
+    customer,
+    lineGroupId: groupId || null,
+  });
+  return { replyText: buildOrderSummaryReply(order, match.product.unit), orderId: order.id, success: true };
+}
+
+/**
+ * Processes a multi-line message where every non-blank line is an
+ * order-input line (rules 1-12). Lines are processed sequentially, not in
+ * parallel, so order numbers come out in the same top-to-bottom sequence
+ * as the lines themselves and the existing atomic per-day counter (see
+ * generateOrderNumber.ts) is exercised exactly as it already is for any
+ * other sequence of orders -- nothing about order-number generation or
+ * concurrency handling is touched here.
+ *
+ * A line that fails (Stage-1 error, ambiguous/not-found product) never
+ * discards or rolls back any other line's already-created order (rule 9);
+ * all outcomes are collected and sent back as ONE combined reply (rule
+ * 10). Multi-line batches deliberately do not track a "last LINE message
+ * id" for reply-to-message purposes -- with several orders in one
+ * message, a later bare-digit reply to it couldn't be unambiguously
+ * attributed to any single one of them, so it's left untracked (a later
+ * reply to that message simply won't match anything, the same safe
+ * fallback as replying to any unrelated message).
+ */
+async function handleMultiLineOrders(
+  lines: ClassifiedLine[],
+  groupId: string,
+  userId: string | null,
+  supabase: SupabaseClient
+): Promise<string> {
+  const results: Array<{ lineNumber: number; success: boolean; text: string }> = [];
+
+  for (const line of lines) {
+    if (line.command.kind === "new_order_tokens") {
+      const outcome = await processNewOrderCommand(line.command, groupId, userId, supabase, {
+        allowPendingConfirmation: false,
+      });
+      results.push({ lineNumber: line.lineNumber, success: outcome.success, text: outcome.replyText });
+      continue;
+    }
+
+    // One of the Stage-1 error kinds (invalid format / ambiguous quantity
+    // / invalid quantity) -- reuse the exact same error-message builders
+    // used for a single-line message, never rebuilt here.
+    const text =
+      line.command.kind === "invalid_quantity"
+        ? buildInvalidQuantityReply(line.command.reason)
+        : line.command.kind === "ambiguous_quantity"
+          ? buildAmbiguousQuantityReply()
+          : buildInvalidOrderFormatReply();
+
+    results.push({ lineNumber: line.lineNumber, success: false, text });
+  }
+
+  return buildMultiLineOrderReply(results);
 }
 
 /**

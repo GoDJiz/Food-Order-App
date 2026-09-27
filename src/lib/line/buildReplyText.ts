@@ -135,6 +135,33 @@ export function buildInvalidPriceReply(): string {
   return "❗ ราคาไม่ถูกต้อง กรุณาระบุราคาที่มากกว่า 0 เช่น สร้าง 50";
 }
 
+export interface MultiLineOrderLineResult {
+  lineNumber: number;
+  success: boolean;
+  /**
+   * For a success: the full order-summary block (reused from
+   * buildOrderSummaryReply, never rebuilt here). For a failure: the
+   * underlying error message (reused from the existing per-error
+   * builders), which this function prefixes with the line number.
+   */
+  text: string;
+}
+
+/**
+ * Combines the per-line results of a multi-order LINE message into one
+ * reply: each successful line's full order block, and each failed line's
+ * error message prefixed with "บรรทัดที่ N" (Line N) so it's clear which
+ * line it refers to. Valid orders are never hidden or rolled back just
+ * because another line failed (rule 9) -- this function only formats
+ * what the caller already decided to create/reject.
+ */
+export function buildMultiLineOrderReply(results: MultiLineOrderLineResult[]): string {
+  const blocks = results.map((r) =>
+    r.success ? r.text : `❗ บรรทัดที่ ${r.lineNumber}: ${r.text}`
+  );
+  return blocks.join("\n\n");
+}
+
 export interface DailySummaryLine {
   productName: string;
   quantity: number;

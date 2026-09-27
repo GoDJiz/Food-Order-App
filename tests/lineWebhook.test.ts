@@ -1251,3 +1251,353 @@ test("explicit order-number commands still work exactly as before, unaffected by
   assert.equal(db.tables.orders[0].status, "done");
   assert.match(result.replyText!, /✅ อัปเดตคำสั่งซื้อ/);
 });
+
+// --- Multi-line order input ---
+
+test("multi-line: two lines, ! on both, creates 2 separate orders", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-1",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 2 ทราย\n!น้ำแครอท 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "น้ำส้ม");
+  assert.equal(db.tables.orders[0].quantity, 2);
+  assert.equal(db.tables.orders[0].customer_name, "ทราย");
+  assert.equal(db.tables.orders[1].product_name_snapshot, "น้ำแครอท");
+  assert.equal(db.tables.orders[1].quantity, 1);
+  assert.equal(db.tables.orders[1].customer_name, "ก๊อต");
+  assert.equal(result.replied, true);
+  assert.match(result.replyText!, /น้ำส้ม/);
+  assert.match(result.replyText!, /น้ำแครอท/);
+});
+
+test("multi-line: ! only on the first line, still creates 2 separate orders", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-2",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 2 ทราย\nน้ำแครอท 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "น้ำส้ม");
+  assert.equal(db.tables.orders[1].product_name_snapshot, "น้ำแครอท");
+});
+
+test("multi-line: three lines create three orders with sequential order numbers", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  seedProduct(db, { id: "p3", name: "กาแฟเย็น", unit: "แก้ว" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-3",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 a\n!น้ำแครอท 1 b\n!กาแฟเย็น 1 c" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 3);
+  const numbers = db.tables.orders.map((o: any) => o.order_number).sort();
+  const suffixes = numbers.map((n: string) => n.split("-")[1]);
+  assert.deepEqual(suffixes, ["0001", "0002", "0003"], "order numbers must be sequential");
+});
+
+test("multi-line: blank lines between orders are ignored", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-blank",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 2 ทราย\n\n\n!น้ำแครอท 1 ก๊อต\n" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+});
+
+test("multi-line: \\r\\n line endings work the same as \\n", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-crlf",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 2 ทราย\r\n!น้ำแครอท 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+});
+
+test("multi-line: multi-word products and customers work per line", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "Fried Rice Chicken Egg", unit: "" });
+  seedProduct(db, { id: "p2", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-word",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!Fried Rice Chicken Egg 2 P'Boy Somchai\n!น้ำส้ม 1 พี่ไก่ สมชาย" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "Fried Rice Chicken Egg");
+  assert.equal(db.tables.orders[0].customer_name, "P'Boy Somchai");
+  assert.equal(db.tables.orders[1].customer_name, "พี่ไก่ สมชาย");
+});
+
+test("multi-line: existing fuzzy product matching still works per line", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-fuzzy",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!นำส้ม 1 ไก่\n!น้ำแครอท 1 ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "น้ำส้ม"); // resolved via fuzzy match
+});
+
+test("multi-line: attached-number syntax works per line", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-attached",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม1 พี่ไก่\n!น้ำแครอท 1ขวด ก๊อต" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2);
+  assert.equal(db.tables.orders[0].quantity, 1);
+  assert.equal(db.tables.orders[0].customer_name, "พี่ไก่");
+  assert.equal(db.tables.orders[1].quantity, 1);
+  assert.equal(db.tables.orders[1].customer_name, "ก๊อต");
+});
+
+test("multi-line: error isolation -- an invalid/unknown line doesn't discard valid orders before or after it", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  seedProduct(db, { id: "p2", name: "น้ำแครอท", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-error",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: {
+        type: "text",
+        text: "!น้ำส้ม 2 ทราย\n!สินค้าที่ไม่มีอยู่จริง 1 ก๊อต\n!น้ำแครอท 1 ก๊อต",
+      },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 2, "the two valid lines must both create orders");
+  assert.equal(db.tables.orders[0].product_name_snapshot, "น้ำส้ม");
+  assert.equal(db.tables.orders[1].product_name_snapshot, "น้ำแครอท");
+  assert.match(result.replyText!, /บรรทัดที่ 2/, "the failing line must be clearly reported by its line number");
+  assert.match(result.replyText!, /ไม่พบสินค้า/);
+});
+
+test("multi-line: a newline inside an existing order-number status command does not become multiple commands", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-status-create",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  const orderNumber = db.tables.orders[0].order_number;
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-status-newline",
+      replyToken: "reply-2",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      // The order number and status digit accidentally split across two
+      // lines -- must behave exactly as the existing single-space form.
+      message: { type: "text", text: `!${orderNumber}\n2` },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 1, "must not create a second order from this");
+  assert.equal(db.tables.orders[0].status, "making");
+  assert.match(result.replyText!, /✅ อัปเดตคำสั่งซื้อ/);
+});
+
+test("multi-line: a message mixing an order line with !summary falls back to the existing single-command behavior", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db, { id: "p1", name: "น้ำส้ม", unit: "ขวด" });
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-multi-summary-mix",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 2 ทราย\n!summary" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  // Line 2 alone would be "!summary", which is a special command -- so the
+  // WHOLE message fails multi-line classification (existing commands take
+  // priority) and falls back to the pre-existing behavior for any
+  // multi-line text: the whole raw string is parsed as ONE command by the
+  // original tokenizer, which has always treated internal newlines as
+  // plain whitespace (unchanged by this feature -- see the
+  // "!<order> \\n <digit>" regression test above for the same fallback
+  // rule applied to a status command). Here that means a single order IS
+  // still created, with the stray "!summary" text absorbed into the
+  // customer field rather than being treated as a separate command --
+  // exactly the same as if this feature didn't exist at all.
+  assert.equal(db.tables.orders.length, 1);
+  assert.equal(db.tables.orders[0].product_name_snapshot, "น้ำส้ม");
+  assert.match(db.tables.orders[0].customer_name, /ทราย/);
+  assert.equal(result.replied, true);
+});
+
+test("single-line messages are completely unaffected by the multi-line feature (regression)", async () => {
+  const db = new FakeSupabase();
+  seedProduct(db);
+  const calls: any[] = [];
+  const restore = withMockedFetch({ calls });
+
+  const result = await handleEvent(
+    {
+      type: "message",
+      webhookEventId: "evt-single-regression",
+      replyToken: "reply-1",
+      source: { groupId: "group-1", userId: "user-1", type: "group" },
+      message: { type: "text", text: "!น้ำส้ม 1 พี่ไก่" },
+    } as any,
+    db as any,
+    "fake-token"
+  );
+
+  restore();
+
+  assert.equal(db.tables.orders.length, 1);
+  assert.match(result.replyText!, /^📦 คำสั่งซื้อ/);
+});
